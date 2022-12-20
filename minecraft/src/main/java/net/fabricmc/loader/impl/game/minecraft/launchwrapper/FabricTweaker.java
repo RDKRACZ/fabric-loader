@@ -26,6 +26,7 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -45,6 +46,7 @@ import net.minecraft.launchwrapper.LaunchClassLoader;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.loader.api.entrypoint.PreLaunchEntrypoint;
 import net.fabricmc.loader.impl.FabricLoaderImpl;
+import net.fabricmc.loader.impl.FormattedException;
 import net.fabricmc.loader.impl.entrypoint.EntrypointUtils;
 import net.fabricmc.loader.impl.game.GameProvider;
 import net.fabricmc.loader.impl.game.minecraft.MinecraftGameProvider;
@@ -52,6 +54,7 @@ import net.fabricmc.loader.impl.launch.FabricLauncherBase;
 import net.fabricmc.loader.impl.launch.FabricMixinBootstrap;
 import net.fabricmc.loader.impl.util.Arguments;
 import net.fabricmc.loader.impl.util.FileSystemUtil;
+import net.fabricmc.loader.impl.util.LoaderUtil;
 import net.fabricmc.loader.impl.util.ManifestUtil;
 import net.fabricmc.loader.impl.util.SystemProperties;
 import net.fabricmc.loader.impl.util.UrlUtil;
@@ -59,9 +62,10 @@ import net.fabricmc.loader.impl.util.log.Log;
 import net.fabricmc.loader.impl.util.log.LogCategory;
 
 public abstract class FabricTweaker extends FabricLauncherBase implements ITweaker {
-	private static final LogCategory LOG_CATEGORY = new LogCategory("GameProvider", "Tweaker");
+	private static final LogCategory LOG_CATEGORY = LogCategory.create("GameProvider", "Tweaker");
 	protected Arguments arguments;
 	private LaunchClassLoader launchClassLoader;
+	private final List<Path> classPath = new ArrayList<>();
 	private boolean isDevelopment;
 
 	@SuppressWarnings("unchecked")
@@ -109,12 +113,33 @@ public abstract class FabricTweaker extends FabricLauncherBase implements ITweak
 		launchClassLoader.addClassLoaderExclusion("net.fabricmc.api.ClientModInitializer");
 		launchClassLoader.addClassLoaderExclusion("net.fabricmc.api.DedicatedServerModInitializer");
 
+		try {
+			init();
+		} catch (FormattedException e) {
+			handleFormattedException(e);
+		}
+	}
+
+	private void init() {
+		setupUncaughtExceptionHandler();
+
+		classPath.clear();
+
+		for (URL url : launchClassLoader.getSources()) {
+			Path path = UrlUtil.asPath(url);
+			if (!Files.exists(path)) continue;
+
+			classPath.add(LoaderUtil.normalizeExistingPath(path));
+		}
+
 		GameProvider provider = new MinecraftGameProvider();
 
 		if (!provider.isEnabled()
-				|| !provider.locateGame(this, arguments.toArray(), launchClassLoader)) {
+				|| !provider.locateGame(this, arguments.toArray())) {
 			throw new RuntimeException("Could not locate Minecraft: provider locate failed");
 		}
+
+		Log.finishBuiltinConfig();
 
 		arguments = null;
 
@@ -138,9 +163,7 @@ public abstract class FabricTweaker extends FabricLauncherBase implements ITweak
 		try {
 			EntrypointUtils.invoke("preLaunch", PreLaunchEntrypoint.class, PreLaunchEntrypoint::onPreLaunch);
 		} catch (RuntimeException e) {
-			if (!provider.onCrash(e, "A mod crashed on startup")) {
-				throw e;
-			}
+			throw new FormattedException("A mod crashed on startup!", e);
 		}
 	}
 
@@ -165,8 +188,13 @@ public abstract class FabricTweaker extends FabricLauncherBase implements ITweak
 	}
 
 	@Override
-	public Collection<URL> getLoadTimeDependencies() {
-		return launchClassLoader.getSources();
+	public void setValidParentClassPath(Collection<Path> paths) {
+		// not implemented (no-op)
+	}
+
+	@Override
+	public List<Path> getClassPath() {
+		return classPath;
 	}
 
 	@Override

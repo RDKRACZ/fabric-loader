@@ -18,6 +18,7 @@ package net.fabricmc.loader.impl.game;
 
 import java.nio.file.Path;
 import java.util.Collection;
+import java.util.List;
 import java.util.Objects;
 
 import net.fabricmc.loader.api.metadata.ModMetadata;
@@ -39,12 +40,15 @@ public interface GameProvider { // name directly referenced in net.fabricmc.load
 	boolean requiresUrlClassLoader();
 
 	boolean isEnabled();
-	boolean locateGame(FabricLauncher launcher, String[] args, ClassLoader loader);
+	boolean locateGame(FabricLauncher launcher, String[] args);
 	void initialize(FabricLauncher launcher);
 	GameTransformer getEntrypointTransformer();
 	void unlockClassPath(FabricLauncher launcher);
 	void launch(ClassLoader loader);
-	boolean onCrash(Throwable exception, String context);
+
+	default boolean displayCrash(Throwable exception, String context) {
+		return false;
+	}
 
 	Arguments getArguments();
 	String[] getLaunchArguments(boolean sanitize);
@@ -58,15 +62,15 @@ public interface GameProvider { // name directly referenced in net.fabricmc.load
 	}
 
 	class BuiltinMod {
-		public BuiltinMod(Path path, ModMetadata metadata) {
-			Objects.requireNonNull(path, "null path");
+		public BuiltinMod(List<Path> paths, ModMetadata metadata) {
+			Objects.requireNonNull(paths, "null paths");
 			Objects.requireNonNull(metadata, "null metadata");
 
-			this.path = path;
+			this.paths = paths;
 			this.metadata = metadata;
 		}
 
-		public final Path path;
+		public final List<Path> paths;
 		public final ModMetadata metadata;
 	}
 }

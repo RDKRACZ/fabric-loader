@@ -16,10 +16,20 @@
 
 package net.fabricmc.loader.impl.launch;
 
+import java.io.FileDescriptor;
+import java.io.FileOutputStream;
+import java.io.PrintWriter;
 import java.lang.reflect.Method;
 import java.util.Map;
 
 import org.spongepowered.asm.mixin.MixinEnvironment;
+
+import net.fabricmc.loader.impl.FabricLoaderImpl;
+import net.fabricmc.loader.impl.FormattedException;
+import net.fabricmc.loader.impl.game.GameProvider;
+import net.fabricmc.loader.impl.gui.FabricGuiEntry;
+import net.fabricmc.loader.impl.util.log.Log;
+import net.fabricmc.loader.impl.util.log.LogCategory;
 
 public abstract class FabricLauncherBase implements FabricLauncher {
 	private static boolean mixinReady;
@@ -62,6 +72,55 @@ public abstract class FabricLauncherBase implements FabricLauncher {
 
 	public static Map<String, Object> getProperties() {
 		return properties;
+	}
+
+	protected static void handleFormattedException(FormattedException exc) {
+		Throwable actualExc = exc.getMessage() != null ? exc : exc.getCause();
+		Log.error(LogCategory.GENERAL, exc.getMainText(), actualExc);
+
+		GameProvider gameProvider = FabricLoaderImpl.INSTANCE.tryGetGameProvider();
+
+		if (gameProvider == null || !gameProvider.displayCrash(actualExc, exc.getMainText())) {
+			FabricGuiEntry.displayError(exc.getMainText(), actualExc, true);
+		} else {
+			System.exit(1);
+		}
+
+		throw new AssertionError("exited");
+	}
+
+	protected static void setupUncaughtExceptionHandler() {
+		Thread mainThread = Thread.currentThread();
+		Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+			@Override
+			public void uncaughtException(Thread t, Throwable e) {
+				try {
+					if (e instanceof FormattedException) {
+						handleFormattedException((FormattedException) e);
+					} else {
+						String mainText = String.format("Uncaught exception in thread \"%s\"", t.getName());
+						Log.error(LogCategory.GENERAL, mainText, e);
+
+						GameProvider gameProvider = FabricLoaderImpl.INSTANCE.tryGetGameProvider();
+
+						if (Thread.currentThread() == mainThread
+								&& (gameProvider == null || !gameProvider.displayCrash(e, mainText))) {
+							FabricGuiEntry.displayError(mainText, e, false);
+						}
+					}
+				} catch (Throwable e2) { // just in case
+					e.addSuppressed(e2);
+
+					try {
+						e.printStackTrace();
+					} catch (Throwable e3) {
+						PrintWriter pw = new PrintWriter(new FileOutputStream(FileDescriptor.err));
+						e.printStackTrace(pw);
+						pw.flush();
+					}
+				}
+			}
+		});
 	}
 
 	protected static void finishMixinBootstrapping() {

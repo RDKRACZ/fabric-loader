@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Collections;
 import java.util.Map;
 
@@ -35,9 +36,11 @@ import org.junit.jupiter.api.Test;
 
 import net.fabricmc.loader.api.SemanticVersion;
 import net.fabricmc.loader.api.metadata.CustomValue;
+import net.fabricmc.loader.impl.metadata.DependencyOverrides;
 import net.fabricmc.loader.impl.metadata.LoaderModMetadata;
 import net.fabricmc.loader.impl.metadata.ModMetadataParser;
 import net.fabricmc.loader.impl.metadata.ParseMetadataException;
+import net.fabricmc.loader.impl.metadata.VersionOverrides;
 
 final class V1ModJsonParsingTests {
 	private static Path testLocation;
@@ -183,7 +186,7 @@ final class V1ModJsonParsingTests {
 
 	private static LoaderModMetadata parseMetadata(Path path) throws IOException, ParseMetadataException {
 		try (InputStream is = Files.newInputStream(path)) {
-			return ModMetadataParser.parseMetadata(null, "dummy", Collections.emptyList());
+			return ModMetadataParser.parseMetadata(is, "dummy", Collections.emptyList(), new VersionOverrides(), new DependencyOverrides(Paths.get("randomMissing")), false);
 		}
 	}
 }

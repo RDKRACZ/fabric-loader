@@ -38,6 +38,8 @@ import net.fabricmc.loader.api.metadata.ModDependency.Kind;
 import net.fabricmc.loader.api.metadata.version.VersionInterval;
 import net.fabricmc.loader.impl.FabricLoaderImpl;
 import net.fabricmc.loader.impl.ModContainerImpl;
+import net.fabricmc.loader.impl.launch.knot.MixinServiceKnot;
+import net.fabricmc.loader.impl.launch.knot.MixinServiceKnotBootstrap;
 import net.fabricmc.loader.impl.util.log.Log;
 import net.fabricmc.loader.impl.util.log.LogCategory;
 import net.fabricmc.loader.impl.util.mappings.MixinIntermediaryDevRemapper;
@@ -52,6 +54,11 @@ public final class FabricMixinBootstrap {
 		if (initialized) {
 			throw new RuntimeException("FabricMixinBootstrap has already been initialized!");
 		}
+
+		System.setProperty("mixin.bootstrapService", MixinServiceKnotBootstrap.class.getName());
+		System.setProperty("mixin.service", MixinServiceKnot.class.getName());
+
+		MixinBootstrap.init();
 
 		if (FabricLauncherBase.getLauncher().isDevelopment()) {
 			MappingConfiguration mappingConfiguration = FabricLauncherBase.getLauncher().getMappingConfiguration();
@@ -75,16 +82,18 @@ public final class FabricMixinBootstrap {
 			}
 		}
 
-		MixinBootstrap.init();
-
 		Map<String, ModContainerImpl> configToModMap = new HashMap<>();
 
 		for (ModContainerImpl mod : loader.getModsInternal()) {
 			for (String config : mod.getMetadata().getMixinConfigs(side)) {
 				ModContainerImpl prev = configToModMap.putIfAbsent(config, mod);
-				if (prev != null) throw new RuntimeException(String.format("Non-unique mixin config name %s used by %s and %s", config, prev.getMetadata().getId(), mod.getMetadata().getId()));
+				if (prev != null) throw new RuntimeException(String.format("Non-unique Mixin config name %s used by the mods %s and %s", config, prev.getMetadata().getId(), mod.getMetadata().getId()));
 
-				Mixins.addConfiguration(config);
+				try {
+					Mixins.addConfiguration(config);
+				} catch (Throwable t) {
+					throw new RuntimeException(String.format("Error creating Mixin config %s for mod %s", config, mod.getMetadata().getId()), t);
+				}
 			}
 		}
 

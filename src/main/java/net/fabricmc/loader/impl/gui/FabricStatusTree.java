@@ -31,6 +31,8 @@ import java.util.Set;
 import java.util.StringJoiner;
 import java.util.function.UnaryOperator;
 
+import net.fabricmc.loader.impl.FormattedException;
+
 public final class FabricStatusTree {
 	public enum FabricTreeWarningLevel {
 		ERROR,
@@ -338,6 +340,20 @@ public final class FabricStatusTree {
 			return string;
 		}
 
+		public FabricStatusNode addMessage(String message, FabricTreeWarningLevel warningLevel) {
+			String[] lines = message.split("\n");
+
+			FabricStatusNode sub = new FabricStatusNode(this, lines[0]);
+			children.add(sub);
+			sub.setWarningLevel(warningLevel);
+
+			for (int i = 1; i < lines.length; i++) {
+				sub.addChild(lines[i]);
+			}
+
+			return sub;
+		}
+
 		public FabricStatusNode addException(Throwable exception) {
 			return addException(this, Collections.newSetFromMap(new IdentityHashMap<>()), exception, UnaryOperator.identity(), new StackTraceElement[0]);
 		}
@@ -393,16 +409,20 @@ public final class FabricStatusTree {
 		}
 
 		private FabricStatusNode addException(Throwable exception, StackTraceElement[] parentTrace) {
-			String msg = exception.getMessage();
-			String[] lines = (msg == null || msg.isEmpty() ? exception.toString() : msg).split("\n");
+			boolean showTrace = !(exception instanceof FormattedException) || exception.getCause() != null;
+			String msg;
 
-			FabricStatusNode sub = new FabricStatusNode(this, lines[0]);
-			children.add(sub);
-			sub.setError();
-
-			for (int i = 1; i < lines.length; i++) {
-				sub.addChild(lines[i]);
+			if (exception instanceof FormattedException) {
+				msg = Objects.toString(exception.getMessage());
+			} else if (exception.getMessage() == null || exception.getMessage().isEmpty()) {
+				msg = exception.toString();
+			} else {
+				msg = String.format("%s: %s", exception.getClass().getSimpleName(), exception.getMessage());
 			}
+
+			FabricStatusNode sub = addMessage(msg, FabricTreeWarningLevel.ERROR);
+
+			if (!showTrace) return sub;
 
 			StackTraceElement[] trace = exception.getStackTrace();
 			int uniqueFrames = trace.length - 1;
@@ -411,7 +431,7 @@ public final class FabricStatusTree {
 				uniqueFrames--;
 			}
 
-			StringJoiner frames = new StringJoiner("<br/>", "<html>", "</html>");
+			StringJoiner frames = new StringJoiner("\n");
 			int inheritedFrames = trace.length - 1 - uniqueFrames;
 
 			for (int i = 0; i <= uniqueFrames; i++) {

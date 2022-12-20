@@ -28,6 +28,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -39,48 +40,72 @@ import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.Future;
 import java.util.concurrent.RecursiveTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
 
 import net.fabricmc.api.EnvType;
-import net.fabricmc.loader.api.Version;
-import net.fabricmc.loader.api.VersionParsingException;
+import net.fabricmc.loader.api.metadata.ModMetadata;
 import net.fabricmc.loader.impl.FabricLoaderImpl;
+import net.fabricmc.loader.impl.FormattedException;
 import net.fabricmc.loader.impl.discovery.ModCandidateFinder.ModCandidateConsumer;
 import net.fabricmc.loader.impl.game.GameProvider.BuiltinMod;
 import net.fabricmc.loader.impl.metadata.BuiltinModMetadata;
+import net.fabricmc.loader.impl.metadata.DependencyOverrides;
 import net.fabricmc.loader.impl.metadata.LoaderModMetadata;
+import net.fabricmc.loader.impl.metadata.MetadataVerifier;
 import net.fabricmc.loader.impl.metadata.ModMetadataParser;
 import net.fabricmc.loader.impl.metadata.NestedJarEntry;
 import net.fabricmc.loader.impl.metadata.ParseMetadataException;
+import net.fabricmc.loader.impl.metadata.VersionOverrides;
 import net.fabricmc.loader.impl.util.ExceptionUtil;
+import net.fabricmc.loader.impl.util.LoaderUtil;
 import net.fabricmc.loader.impl.util.SystemProperties;
 import net.fabricmc.loader.impl.util.log.Log;
 import net.fabricmc.loader.impl.util.log.LogCategory;
-import net.fabricmc.loader.impl.util.version.VersionParser;
 
 public final class ModDiscoverer {
+	private final VersionOverrides versionOverrides;
+	private final DependencyOverrides depOverrides;
 	private final List<ModCandidateFinder> candidateFinders = new ArrayList<>();
 	private final EnvType envType = FabricLoaderImpl.INSTANCE.getEnvironmentType();
 	private final Map<Long, ModScanTask> jijDedupMap = new ConcurrentHashMap<>(); // avoids reading the same jar twice
 	private final List<NestedModInitData> nestedModInitDatas = Collections.synchronizedList(new ArrayList<>()); // breaks potential cycles from deduplication
 
+	public ModDiscoverer(VersionOverrides versionOverrides, DependencyOverrides depOverrides) {
+		this.versionOverrides = versionOverrides;
+		this.depOverrides = depOverrides;
+	}
+
 	public void addCandidateFinder(ModCandidateFinder f) {
 		candidateFinders.add(f);
 	}
 
-	public List<ModCandidate> discoverMods(FabricLoaderImpl loader) throws ModResolutionException {
+	public List<ModCandidate> discoverMods(FabricLoaderImpl loader, Map<String, Set<ModCandidate>> envDisabledModsOut) throws ModResolutionException {
 		long startTime = System.nanoTime();
 		ForkJoinPool pool = new ForkJoinPool();
-		Set<Path> paths = new HashSet<>(); // suppresses duplicate paths
+		Set<Path> processedPaths = new HashSet<>(); // suppresses duplicate paths
 		List<Future<ModCandidate>> futures = new ArrayList<>();
 
-		ModCandidateConsumer taskSubmitter = (path, requiresRemap) -> {
-			path = path.toAbsolutePath().normalize();
+		ModCandidateConsumer taskSubmitter = (paths, requiresRemap) -> {
+			if (paths.size() == 1) {
+				Path path = LoaderUtil.normalizeExistingPath(paths.get(0));
 
-			if (paths.add(path)) {
-				futures.add(pool.submit(new ModScanTask(path, requiresRemap)));
+				if (processedPaths.add(path)) {
+					futures.add(pool.submit(new ModScanTask(Collections.singletonList(path), requiresRemap)));
+				}
+			} else {
+				List<Path> normalizedPaths = new ArrayList<>(paths.size());
+
+				for (Path path : paths) {
+					normalizedPaths.add(LoaderUtil.normalizeExistingPath(path));
+				}
+
+				if (!processedPaths.containsAll(normalizedPaths)) {
+					processedPaths.addAll(normalizedPaths);
+					futures.add(pool.submit(new ModScanTask(normalizedPaths, requiresRemap)));
+				}
 			}
 		};
 
@@ -92,29 +117,26 @@ public final class ModDiscoverer {
 
 		// add builtin mods
 		for (BuiltinMod mod : loader.getGameProvider().getBuiltinMods()) {
-			candidates.add(ModCandidate.createBuiltin(mod));
+			ModCandidate candidate = ModCandidate.createBuiltin(mod, versionOverrides, depOverrides);
+			candidates.add(MetadataVerifier.verifyIndev(candidate, loader.isDevelopmentEnvironment()));
 		}
 
 		// Add the current Java version
-		candidates.add(ModCandidate.createBuiltin(new BuiltinMod(
-				Paths.get(System.getProperty("java.home")),
-				new BuiltinModMetadata.Builder("java", System.getProperty("java.specification.version").replaceFirst("^1\\.", ""))
-				.setName(System.getProperty("java.vm.name"))
-				.build())));
+		candidates.add(MetadataVerifier.verifyIndev(createJavaMod(), loader.isDevelopmentEnvironment()));
 
 		ModResolutionException exception = null;
 
+		int timeout = Integer.getInteger(SystemProperties.DEBUG_DISCOVERY_TIMEOUT, 60);
+		if (timeout <= 0) timeout = Integer.MAX_VALUE;
+
 		try {
 			pool.shutdown();
-
-			int timeout = Integer.getInteger(SystemProperties.DEBUG_DISCOVERY_TIMEOUT, 60);
-			if (timeout <= 0) timeout = Integer.MAX_VALUE;
 
 			pool.awaitTermination(timeout, TimeUnit.SECONDS);
 
 			for (Future<ModCandidate> future : futures) {
 				if (!future.isDone()) {
-					throw new ModResolutionException("Mod discovery took too long!");
+					throw new TimeoutException();
 				}
 
 				try {
@@ -128,7 +150,7 @@ public final class ModDiscoverer {
 			for (NestedModInitData data : nestedModInitDatas) {
 				for (Future<ModCandidate> future : data.futures) {
 					if (!future.isDone()) {
-						throw new ModResolutionException("Mod discovery took too long!");
+						throw new TimeoutException();
 					}
 
 					try {
@@ -139,87 +161,71 @@ public final class ModDiscoverer {
 					}
 				}
 			}
+		} catch (TimeoutException e) {
+			throw new FormattedException("Mod discovery took too long!",
+					"Analyzing the mod folder contents took longer than %d seconds. This may be caused by unusually slow hardware, pathological antivirus interference or other issues. The timeout can be changed with the system property %s (-D%<s=<desired timeout in seconds>).",
+					timeout, SystemProperties.DEBUG_DISCOVERY_TIMEOUT);
 		} catch (InterruptedException e) {
-			throw new ModResolutionException("Mod discovery took too long!", e);
+			throw new FormattedException("Mod discovery interrupted!", e);
 		}
 
 		if (exception != null) {
 			throw exception;
 		}
 
-		// initialize parent data
+		// gather gather all mods (root+nested), initialize parent data
 
+		Set<ModCandidate> ret = Collections.newSetFromMap(new IdentityHashMap<>(candidates.size() * 2));
 		Queue<ModCandidate> queue = new ArrayDeque<>(candidates);
 		ModCandidate mod;
 
 		while ((mod = queue.poll()) != null) {
-			for (ModCandidate child : mod.getNestedMods()) {
-				if (child.addParent(mod)) {
-					queue.add(child);
+			if (mod.getMetadata().loadsInEnvironment(envType)) {
+				if (!ret.add(mod)) continue;
+
+				for (ModCandidate child : mod.getNestedMods()) {
+					if (child.addParent(mod)) {
+						queue.add(child);
+					}
 				}
+			} else {
+				envDisabledModsOut.computeIfAbsent(mod.getId(), ignore -> Collections.newSetFromMap(new IdentityHashMap<>())).add(mod);
 			}
 		}
-
-		// apply version replacements
-
-		applyVersionReplacements(candidates);
 
 		long endTime = System.nanoTime();
 
 		Log.debug(LogCategory.DISCOVERY, "Mod discovery time: %.1f ms", (endTime - startTime) * 1e-6);
 
-		return candidates;
+		return new ArrayList<>(ret);
 	}
 
-	private static void applyVersionReplacements(List<ModCandidate> mods) {
-		String replacements = System.getProperty(SystemProperties.DEBUG_REPLACE_VERSION);
-		if (replacements == null) return;
+	private ModCandidate createJavaMod() {
+		ModMetadata metadata = new BuiltinModMetadata.Builder("java", System.getProperty("java.specification.version").replaceFirst("^1\\.", ""))
+				.setName(System.getProperty("java.vm.name"))
+				.build();
+		BuiltinMod builtinMod = new BuiltinMod(Collections.singletonList(Paths.get(System.getProperty("java.home"))), metadata);
 
-		for (String entry : replacements.split(",")) {
-			int pos = entry.indexOf(":");
-			if (pos <= 0 || pos >= entry.length() - 1) throw new RuntimeException("invalid version replacement entry: "+entry);
-
-			String id = entry.substring(0, pos);
-			String rawVersion = entry.substring(pos + 1);
-			Version version;
-
-			try {
-				version = VersionParser.parse(rawVersion, false);
-			} catch (VersionParsingException e) {
-				throw new RuntimeException(String.format("Invalid replacement version for mod %s: %s", id, rawVersion), e);
-			}
-
-			boolean found = false;
-
-			for (ModCandidate mod : mods) {
-				if (mod.getId().equals(id)) {
-					found = true;
-					mod.getMetadata().setVersion(version);
-					break;
-				}
-			}
-
-			if (!found) Log.warn(LogCategory.DISCOVERY, "Can't find mod %s referenced by a version replacement", id);
-		}
+		return ModCandidate.createBuiltin(builtinMod, versionOverrides, depOverrides);
 	}
 
 	@SuppressWarnings("serial")
 	final class ModScanTask extends RecursiveTask<ModCandidate> {
-		private final Path path;
+		private final List<Path> paths;
 		private final String localPath;
 		private final RewindableInputStream is;
 		private final long hash;
 		private final boolean requiresRemap;
 		private final List<String> parentPaths;
 
-		ModScanTask(Path path, boolean requiresRemap) {
-			this(path, null, null, -1, requiresRemap, Collections.emptyList());
+		ModScanTask(List<Path> paths, boolean requiresRemap) {
+			this(paths, null, null, -1, requiresRemap, Collections.emptyList());
 		}
 
-		private ModScanTask(Path path, String localPath, RewindableInputStream is, long hash,
+		private ModScanTask(List<Path> paths, String localPath, RewindableInputStream is, long hash,
 				boolean requiresRemap, List<String> parentPaths) {
-			this.path = path;
-			this.localPath = localPath != null ? localPath : path.toString();
+			this.paths = paths;
+			this.localPath = localPath != null ? localPath : paths.get(0).toString();
 			this.is = is;
 			this.hash = hash;
 			this.requiresRemap = requiresRemap;
@@ -238,33 +244,43 @@ public final class ModDiscoverer {
 				}
 			} else { // regular classes-dir or jar
 				try {
-					if (Files.isDirectory(path)) {
-						return computeDir();
-					} else {
-						return computeJarFile();
+					for (Path path : paths) {
+						final ModCandidate candidate;
+
+						if (Files.isDirectory(path)) {
+							candidate = computeDir(path);
+						} else {
+							candidate = computeJarFile(path);
+						}
+
+						if (candidate != null) {
+							return candidate;
+						}
 					}
 				} catch (ParseMetadataException e) { // already contains all context
 					throw ExceptionUtil.wrap(e);
 				} catch (Throwable t) {
-					throw new RuntimeException(String.format("Error analyzing %s: %s", path, t), t);
+					throw new RuntimeException(String.format("Error analyzing %s: %s", paths, t), t);
 				}
+
+				return null;
 			}
 		}
 
-		private ModCandidate computeDir() throws IOException, ParseMetadataException {
+		private ModCandidate computeDir(Path path) throws IOException, ParseMetadataException {
 			Path modJson = path.resolve("fabric.mod.json");
 			if (!Files.exists(modJson)) return null;
 
 			LoaderModMetadata metadata;
 
 			try (InputStream is = Files.newInputStream(modJson)) {
-				metadata = ModMetadataParser.parseMetadata(is, localPath, parentPaths);
+				metadata = parseMetadata(is, path.toString());
 			}
 
-			return ModCandidate.createPlain(path, metadata, requiresRemap, Collections.emptyList());
+			return ModCandidate.createPlain(paths, metadata, requiresRemap, Collections.emptyList());
 		}
 
-		private ModCandidate computeJarFile() throws IOException, ParseMetadataException {
+		private ModCandidate computeJarFile(Path path) throws IOException, ParseMetadataException {
 			try (ZipFile zf = new ZipFile(path.toFile())) {
 				ZipEntry entry = zf.getEntry("fabric.mod.json");
 				if (entry == null) return null;
@@ -272,11 +288,11 @@ public final class ModDiscoverer {
 				LoaderModMetadata metadata;
 
 				try (InputStream is = zf.getInputStream(entry)) {
-					metadata = ModMetadataParser.parseMetadata(is, localPath, parentPaths);
+					metadata = parseMetadata(is, localPath);
 				}
 
 				if (!metadata.loadsInEnvironment(envType)) {
-					return ModCandidate.createPlain(path, metadata, requiresRemap, Collections.emptyList());
+					return ModCandidate.createPlain(paths, metadata, requiresRemap, Collections.emptyList());
 				}
 
 				List<ModScanTask> nestedModTasks;
@@ -329,7 +345,7 @@ public final class ModDiscoverer {
 					nestedModInitDatas.add(new NestedModInitData(nestedModTasks, nestedMods));
 				}
 
-				return ModCandidate.createPlain(path, metadata, requiresRemap, nestedMods);
+				return ModCandidate.createPlain(paths, metadata, requiresRemap, nestedMods);
 			}
 		}
 
@@ -340,7 +356,7 @@ public final class ModDiscoverer {
 			try (ZipInputStream zis = new ZipInputStream(is)) {
 				while ((entry = zis.getNextEntry()) != null) {
 					if (entry.getName().equals("fabric.mod.json")) {
-						metadata = ModMetadataParser.parseMetadata(zis, localPath, parentPaths);
+						metadata = parseMetadata(zis, localPath);
 						break;
 					}
 				}
@@ -447,6 +463,10 @@ public final class ModDiscoverer {
 			if (localTask != null) localTask.invoke();
 
 			return tasks;
+		}
+
+		private LoaderModMetadata parseMetadata(InputStream is, String localPath) throws ParseMetadataException {
+			return ModMetadataParser.parseMetadata(is, localPath, parentPaths, versionOverrides, depOverrides, FabricLoaderImpl.INSTANCE.isDevelopmentEnvironment());
 		}
 	}
 

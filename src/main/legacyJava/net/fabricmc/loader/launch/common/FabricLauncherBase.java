@@ -18,9 +18,12 @@ package net.fabricmc.loader.launch.common;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.URISyntaxException;
+import java.net.MalformedURLException;
 import java.net.URL;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 
 import net.fabricmc.api.EnvType;
 import net.fabricmc.loader.api.FabricLoader;
@@ -48,11 +51,7 @@ public class FabricLauncherBase implements FabricLauncher {
 
 	@Override
 	public void propose(URL url) {
-		try {
-			parent.addToClassPath(UrlUtil.asPath(url));
-		} catch (URISyntaxException e) {
-			throw new RuntimeException(e);
-		}
+		parent.addToClassPath(UrlUtil.asPath(url));
 	}
 
 	@Override
@@ -87,6 +86,16 @@ public class FabricLauncherBase implements FabricLauncher {
 
 	@Override
 	public Collection<URL> getLoadTimeDependencies() {
-		return parent.getLoadTimeDependencies();
+		List<URL> ret = new ArrayList<>();
+
+		for (Path path : parent.getClassPath()) {
+			try {
+				ret.add(UrlUtil.asUrl(path));
+			} catch (MalformedURLException e) {
+				throw new RuntimeException(e);
+			}
+		}
+
+		return ret;
 	}
 }

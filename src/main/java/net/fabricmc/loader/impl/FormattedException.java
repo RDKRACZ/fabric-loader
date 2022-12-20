@@ -17,22 +17,34 @@
 package net.fabricmc.loader.impl;
 
 @SuppressWarnings("serial")
-public class DependencyException extends RuntimeException {
-	public DependencyException() { }
+public final class FormattedException extends RuntimeException {
+	private final String mainText;
 
-	public DependencyException(String message) {
+	public FormattedException(String mainText, String message) {
 		super(message);
+
+		this.mainText = mainText;
 	}
 
-	public DependencyException(String message, Throwable cause) {
+	public FormattedException(String mainText, String format, Object... args) {
+		super(String.format(format, args));
+
+		this.mainText = mainText;
+	}
+
+	public FormattedException(String mainText, String message, Throwable cause) {
 		super(message, cause);
+
+		this.mainText = mainText;
 	}
 
-	public DependencyException(Throwable cause) {
+	public FormattedException(String mainText, Throwable cause) {
 		super(cause);
+
+		this.mainText = mainText;
 	}
 
-	public DependencyException(String message, Throwable cause, boolean enableSuppression, boolean writableStackTrace) {
-		super(message, cause, enableSuppression, writableStackTrace);
+	public String getMainText() {
+		return mainText;
 	}
 }

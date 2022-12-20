@@ -30,6 +30,7 @@ import java.util.List;
 
 import net.fabricmc.loader.impl.FabricLoaderImpl;
 import net.fabricmc.loader.impl.util.Arguments;
+import net.fabricmc.loader.impl.util.LoaderUtil;
 import net.fabricmc.loader.impl.util.SystemProperties;
 import net.fabricmc.loader.impl.util.log.Log;
 import net.fabricmc.loader.impl.util.log.LogCategory;
@@ -58,7 +59,7 @@ public class ArgumentModCandidateFinder implements ModCandidateFinder {
 				Path path = Paths.get(pathStr.substring(1));
 
 				if (!Files.isRegularFile(path)) {
-					Log.warn(LogCategory.DISCOVERY, "Missing/invalid %s provided mod list file %s", source, path);
+					Log.warn(LogCategory.DISCOVERY, "Skipping missing/invalid %s provided mod list file %s", source, path);
 					continue;
 				}
 
@@ -82,10 +83,10 @@ public class ArgumentModCandidateFinder implements ModCandidateFinder {
 	}
 
 	private void addMod(String pathStr, String source, ModCandidateConsumer out) {
-		Path path = Paths.get(pathStr).toAbsolutePath().normalize();
+		Path path = LoaderUtil.normalizePath(Paths.get(pathStr));
 
 		if (!Files.exists(path)) { // missing
-			Log.warn(LogCategory.DISCOVERY, "Missing %s provided mod path %s", source, path);
+			Log.warn(LogCategory.DISCOVERY, "Skipping missing %s provided mod path %s", source, path);
 		} else if (Files.isDirectory(path)) { // directory for extracted mod (in-dev usually) or jars (like mods, but recursive)
 			if (isHidden(path)) {
 				Log.warn(LogCategory.DISCOVERY, "Ignoring hidden %s provided mod path %s", source, path);

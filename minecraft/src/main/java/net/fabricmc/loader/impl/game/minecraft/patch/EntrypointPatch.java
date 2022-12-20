@@ -98,7 +98,31 @@ public class EntrypointPatch extends GamePatch {
 				throw new RuntimeException("Could not find main method in " + entrypoint + "!");
 			}
 
-			if (type == EnvType.SERVER) {
+			if (type == EnvType.CLIENT && mainMethod.instructions.size() < 10) {
+				// 22w24+ forwards to another method in the same class instead of processing in main() directly, use that other method instead if that's the case
+				MethodInsnNode invocation = null;
+
+				for (AbstractInsnNode insn : mainMethod.instructions) {
+					MethodInsnNode methodInsn;
+
+					if (invocation == null
+							&& insn.getType() == AbstractInsnNode.METHOD_INSN
+							&& (methodInsn = (MethodInsnNode) insn).owner.equals(mainClass.name)) {
+						// capture first method insn to the same class
+						invocation = methodInsn;
+					} else if (insn.getOpcode() > Opcodes.ALOAD // ignore constant and variable loads as well as NOP, labels and line numbers
+							&& insn.getOpcode() != Opcodes.RETURN) { // and RETURN
+						// found unexpected insn for a simple forwarding method
+						invocation = null;
+						break;
+					}
+				}
+
+				if (invocation != null) { // simple forwarder confirmed, use its target for further processing
+					final MethodInsnNode reqMethod = invocation;
+					mainMethod = findMethod(mainClass, m -> m.name.equals(reqMethod.name) && m.desc.equals(reqMethod.desc));
+				}
+			} else if (type == EnvType.SERVER) {
 				// pre-1.6 method search route
 				MethodInsnNode newGameInsn = (MethodInsnNode) findInsn(mainMethod,
 						(insn) -> insn.getOpcode() == Opcodes.INVOKESPECIAL && ((MethodInsnNode) insn).name.equals("<init>") && ((MethodInsnNode) insn).owner.equals(mainClass.name),
@@ -258,7 +282,8 @@ public class EntrypointPatch extends GamePatch {
 				// Is only method that returns a class instance
 				// If we do not find this, then we are certain this is 20w22a.
 				MethodNode serverStartMethod = findMethod(mainClass, method -> {
-					if (method.name.equals("main") && method.desc.equals("([Ljava/lang/String;)V")) {
+					if ((method.access & Opcodes.ACC_SYNTHETIC) == 0 // reject non-synthetic
+							|| method.name.equals("main") && method.desc.equals("([Ljava/lang/String;)V")) { // reject main method (theoretically superfluous now)
 						return false;
 					}
 

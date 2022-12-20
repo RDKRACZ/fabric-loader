@@ -19,11 +19,10 @@ package net.fabricmc.loader.impl.launch.knot;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.MalformedURLException;
-import java.net.URISyntaxException;
-import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -31,22 +30,21 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Objects;
 import java.util.ServiceLoader;
 import java.util.jar.Manifest;
 import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
-import org.spongepowered.asm.launch.MixinBootstrap;
-
 import net.fabricmc.api.EnvType;
 import net.fabricmc.loader.api.entrypoint.PreLaunchEntrypoint;
 import net.fabricmc.loader.impl.FabricLoaderImpl;
+import net.fabricmc.loader.impl.FormattedException;
 import net.fabricmc.loader.impl.entrypoint.EntrypointUtils;
 import net.fabricmc.loader.impl.game.GameProvider;
 import net.fabricmc.loader.impl.launch.FabricLauncherBase;
 import net.fabricmc.loader.impl.launch.FabricMixinBootstrap;
+import net.fabricmc.loader.impl.util.LoaderUtil;
 import net.fabricmc.loader.impl.util.SystemProperties;
 import net.fabricmc.loader.impl.util.UrlUtil;
 import net.fabricmc.loader.impl.util.log.Log;
@@ -58,25 +56,29 @@ public final class Knot extends FabricLauncherBase {
 	private KnotClassLoaderInterface classLoader;
 	private boolean isDevelopment;
 	private EnvType envType;
-	private final File gameJarFile;
+	private final List<Path> classPath = new ArrayList<>();
 	private GameProvider provider;
 	private boolean unlocked;
 
 	public static void launch(String[] args, EnvType type) {
-		String gameJarPath = System.getProperty(SystemProperties.GAME_JAR_PATH);
-		Knot knot = new Knot(type, gameJarPath != null ? new File(gameJarPath) : null);
-		ClassLoader cl = knot.init(args);
+		setupUncaughtExceptionHandler();
 
-		if (knot.provider == null) {
-			throw new IllegalStateException("Game provider was not initialized! (Knot#init(String[]))");
+		try {
+			Knot knot = new Knot(type);
+			ClassLoader cl = knot.init(args);
+
+			if (knot.provider == null) {
+				throw new IllegalStateException("Game provider was not initialized! (Knot#init(String[]))");
+			}
+
+			knot.provider.launch(cl);
+		} catch (FormattedException e) {
+			handleFormattedException(e);
 		}
-
-		knot.provider.launch(cl);
 	}
 
-	public Knot(EnvType type, File gameJarFile) {
+	public Knot(EnvType type) {
 		this.envType = type;
-		this.gameJarFile = gameJarFile;
 	}
 
 	protected ClassLoader init(String[] args) {
@@ -99,16 +101,43 @@ public final class Knot extends FabricLauncherBase {
 			}
 		}
 
+		classPath.clear();
+
+		List<String> missing = null;
+		List<String> unsupported = null;
+
+		for (String cpEntry : System.getProperty("java.class.path").split(File.pathSeparator)) {
+			if (cpEntry.equals("*") || cpEntry.endsWith(File.separator + "*")) {
+				if (unsupported == null) unsupported = new ArrayList<>();
+				unsupported.add(cpEntry);
+				continue;
+			}
+
+			Path path = Paths.get(cpEntry);
+
+			if (!Files.exists(path)) {
+				if (missing == null) missing = new ArrayList<>();
+				missing.add(cpEntry);
+				continue;
+			}
+
+			classPath.add(LoaderUtil.normalizeExistingPath(path));
+		}
+
+		if (unsupported != null) Log.warn(LogCategory.KNOT, "Knot does not support wildcard class path entries: %s - the game may not load properly!", String.join(", ", unsupported));
+		if (missing != null) Log.warn(LogCategory.KNOT, "Class path entries reference missing files: %s - the game may not load properly!", String.join(", ", missing));
+
 		provider = createGameProvider(args);
-		Log.info(LogCategory.GAME_PROVIDER, "Loading for game %s %s", provider.getGameName(), provider.getRawGameVersion());
+		Log.finishBuiltinConfig();
+		Log.info(LogCategory.GAME_PROVIDER, "Loading %s %s with Fabric Loader %s", provider.getGameName(), provider.getRawGameVersion(), FabricLoaderImpl.VERSION);
 
 		isDevelopment = Boolean.parseBoolean(System.getProperty(SystemProperties.DEVELOPMENT, "false"));
 
 		// Setup classloader
 		// TODO: Provide KnotCompatibilityClassLoader in non-exclusive-Fabric pre-1.13 environments?
 		boolean useCompatibility = provider.requiresUrlClassLoader() || Boolean.parseBoolean(System.getProperty("fabric.loader.useCompatibilityClassLoader", "false"));
-		classLoader = useCompatibility ? new KnotCompatibilityClassLoader(isDevelopment(), envType, provider) : new KnotClassLoader(isDevelopment(), envType, provider);
-		ClassLoader cl = (ClassLoader) classLoader;
+		classLoader = KnotClassLoaderInterface.create(useCompatibility, isDevelopment(), envType, provider);
+		ClassLoader cl = classLoader.getClassLoader();
 
 		provider.initialize(this);
 
@@ -121,11 +150,10 @@ public final class Knot extends FabricLauncherBase {
 
 		FabricLoaderImpl.INSTANCE.loadAccessWideners();
 
-		MixinBootstrap.init();
 		FabricMixinBootstrap.init(getEnvironmentType(), loader);
 		FabricLauncherBase.finishMixinBootstrapping();
 
-		classLoader.getDelegate().initializeTransformers();
+		classLoader.initializeTransformers();
 
 		provider.unlockClassPath(this);
 		unlocked = true;
@@ -133,9 +161,7 @@ public final class Knot extends FabricLauncherBase {
 		try {
 			EntrypointUtils.invoke("preLaunch", PreLaunchEntrypoint.class, PreLaunchEntrypoint::onPreLaunch);
 		} catch (RuntimeException e) {
-			if (!provider.onCrash(e, "A mod crashed on startup")) {
-				throw e;
-			}
+			throw new FormattedException("A mod crashed on startup!", e);
 		}
 
 		return cl;
@@ -145,11 +171,10 @@ public final class Knot extends FabricLauncherBase {
 		// fast path with direct lookup
 
 		GameProvider embeddedGameProvider = findEmbedddedGameProvider();
-		ClassLoader cl = Knot.class.getClassLoader();
 
 		if (embeddedGameProvider != null
 				&& embeddedGameProvider.isEnabled()
-				&& embeddedGameProvider.locateGame(this, args, cl)) {
+				&& embeddedGameProvider.locateGame(this, args)) {
 			return embeddedGameProvider;
 		}
 
@@ -161,7 +186,7 @@ public final class Knot extends FabricLauncherBase {
 			if (!provider.isEnabled()) continue; // don't attempt disabled providers and don't include them in the error report
 
 			if (provider != embeddedGameProvider // don't retry already failed provider
-					&& provider.locateGame(this, args, cl)) {
+					&& provider.locateGame(this, args)) {
 				return provider;
 			}
 
@@ -196,8 +221,8 @@ public final class Knot extends FabricLauncherBase {
 	 */
 	private static GameProvider findEmbedddedGameProvider() {
 		try {
-			Path flPath = UrlUtil.asPath(Knot.class.getProtectionDomain().getCodeSource().getLocation());
-			if (!flPath.getFileName().toString().endsWith(".jar")) return null; // not a jar
+			Path flPath = UrlUtil.getCodeSource(Knot.class);
+			if (flPath == null || !flPath.getFileName().toString().endsWith(".jar")) return null; // not a jar
 
 			try (ZipFile zf = new ZipFile(flPath.toFile())) {
 				ZipEntry entry = zf.getEntry("META-INF/services/net.fabricmc.loader.impl.game.GameProvider"); // same file as used by service loader
@@ -226,7 +251,7 @@ public final class Knot extends FabricLauncherBase {
 			}
 
 			return null;
-		} catch (IOException | URISyntaxException | ReflectiveOperationException e) {
+		} catch (IOException | ReflectiveOperationException e) {
 			throw new RuntimeException(e);
 		}
 	}
@@ -238,52 +263,26 @@ public final class Knot extends FabricLauncherBase {
 	}
 
 	@Override
-	public Collection<URL> getLoadTimeDependencies() {
-		String cmdLineClasspath = System.getProperty("java.class.path");
-
-		return Arrays.stream(cmdLineClasspath.split(File.pathSeparator)).filter((s) -> {
-			if (s.equals("*") || s.endsWith(File.separator + "*")) {
-				Log.warn(LogCategory.KNOT, "Knot does not support wildcard classpath entries: %s - the game may not load properly!", s);
-				return false;
-			} else {
-				return true;
-			}
-		}).map((s) -> {
-			File file = new File(s);
-
-			if (!file.equals(gameJarFile)) {
-				try {
-					return (UrlUtil.asUrl(file));
-				} catch (MalformedURLException e) {
-					Log.debug(LogCategory.KNOT, "Can't determine url for %s", file, e);
-					return null;
-				}
-			} else {
-				return null;
-			}
-		}).filter(Objects::nonNull).collect(Collectors.toSet());
+	public List<Path> getClassPath() {
+		return classPath;
 	}
 
 	@Override
 	public void addToClassPath(Path path, String... allowedPrefixes) {
 		Log.debug(LogCategory.KNOT, "Adding " + path + " to classpath.");
 
-		try {
-			URL url = UrlUtil.asUrl(path);
-			classLoader.getDelegate().setAllowedPrefixes(url, allowedPrefixes);
-			classLoader.addURL(url);
-		} catch (MalformedURLException e) {
-			throw new RuntimeException(e);
-		}
+		classLoader.setAllowedPrefixes(path, allowedPrefixes);
+		classLoader.addCodeSource(path);
 	}
 
 	@Override
 	public void setAllowedPrefixes(Path path, String... prefixes) {
-		try {
-			classLoader.getDelegate().setAllowedPrefixes(UrlUtil.asUrl(path), prefixes);
-		} catch (MalformedURLException e) {
-			throw new RuntimeException(e);
-		}
+		classLoader.setAllowedPrefixes(path, prefixes);
+	}
+
+	@Override
+	public void setValidParentClassPath(Collection<Path> paths) {
+		classLoader.setValidParentClassPath(paths);
 	}
 
 	@Override
@@ -303,16 +302,14 @@ public final class Knot extends FabricLauncherBase {
 
 	@Override
 	public InputStream getResourceAsStream(String name) {
-		try {
-			return classLoader.getResourceAsStream(name, false);
-		} catch (IOException e) {
-			throw new RuntimeException("Failed to read file '" + name + "'!", e);
-		}
+		return classLoader.getClassLoader().getResourceAsStream(name);
 	}
 
 	@Override
 	public ClassLoader getTargetClassLoader() {
-		return (ClassLoader) classLoader;
+		KnotClassLoaderInterface classLoader = this.classLoader;
+
+		return classLoader != null ? classLoader.getClassLoader() : null;
 	}
 
 	@Override
@@ -320,19 +317,15 @@ public final class Knot extends FabricLauncherBase {
 		if (!unlocked) throw new IllegalStateException("early getClassByteArray access");
 
 		if (runTransformers) {
-			return classLoader.getDelegate().getPreMixinClassByteArray(name, true);
+			return classLoader.getPreMixinClassBytes(name);
 		} else {
-			return classLoader.getDelegate().getRawClassByteArray(name, true);
+			return classLoader.getRawClassBytes(name);
 		}
 	}
 
 	@Override
 	public Manifest getManifest(Path originPath) {
-		try {
-			return classLoader.getDelegate().getMetadata(UrlUtil.asUrl(originPath)).manifest;
-		} catch (MalformedURLException e) {
-			throw new RuntimeException(e);
-		}
+		return classLoader.getManifest(originPath);
 	}
 
 	@Override
@@ -346,6 +339,10 @@ public final class Knot extends FabricLauncherBase {
 	}
 
 	public static void main(String[] args) {
-		new Knot(null, null).init(args);
+		new Knot(null).init(args);
+	}
+
+	static {
+		LoaderUtil.verifyNotInTargetCl(Knot.class);
 	}
 }
